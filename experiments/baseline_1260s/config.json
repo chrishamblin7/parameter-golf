@@ -1,0 +1,47 @@
+{
+  "git_sha": "50390d60884bbfa269d11c1ac0b9b425f8b83f37",
+  "command": "unset NCCL_NET && RUN_ID=baseline_1260s DATA_PATH=./data/datasets/fineweb10B_sp1024 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 MAX_WALLCLOCK_SECONDS=1260 TRAIN_LOG_EVERY=50 VAL_LOSS_EVERY=200 /usr/bin/python3 -m torch.distributed.run --standalone --nproc_per_node=8 train_gpt.py",
+  "env_overrides": {
+    "RUN_ID": "baseline_1260s",
+    "DATA_PATH": "./data/datasets/fineweb10B_sp1024",
+    "TOKENIZER_PATH": "./data/tokenizers/fineweb_1024_bpe.model",
+    "VOCAB_SIZE": "1024",
+    "MAX_WALLCLOCK_SECONDS": "1260",
+    "TRAIN_LOG_EVERY": "50",
+    "VAL_LOSS_EVERY": "200",
+    "NUM_LAYERS": "9",
+    "MODEL_DIM": "512",
+    "NUM_HEADS": "8",
+    "NUM_KV_HEADS": "4",
+    "MLP_MULT": "2"
+  },
+  "hardware": {
+    "gpus": [
+      "NVIDIA A100-SXM4-40GB"
+    ],
+    "gpu_count": 8,
+    "driver_version": "570.211.01"
+  },
+  "software": {
+    "python_version": "3.10.12 (main, Jan  8 2026, 06:52:19) [GCC 11.4.0]",
+    "torch_version": "2.7.1+cu128",
+    "torch_cuda_version": "12.8",
+    "sentencepiece_version": "0.2.1"
+  },
+  "data": {
+    "data_path": "./data/datasets/fineweb10B_sp1024",
+    "tokenizer_path": "./data/tokenizers/fineweb_1024_bpe.model"
+  },
+  "model": {
+    "param_count": 17059912
+  },
+  "results": {
+    "total_steps": 13788,
+    "total_train_time_ms": 1260109,
+    "pre_quant_val_loss": 2.0652,
+    "pre_quant_val_bpb": 1.2231,
+    "post_quant_val_loss": 2.07865929,
+    "post_quant_val_bpb": 1.23109911,
+    "model_int8_zlib_bytes": 15821673
+  }
+}

@@ -86,6 +86,13 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Pruning hyperparameters.  Set PRUNE_FINAL_SPARSITY > 0 to enable.
+    prune_final_sparsity = float(os.environ.get("PRUNE_FINAL_SPARSITY", 0.0))
+    prune_start_frac = float(os.environ.get("PRUNE_START_FRAC", 0.20))
+    prune_end_frac = float(os.environ.get("PRUNE_END_FRAC", 0.80))
+    prune_every = int(os.environ.get("PRUNE_EVERY", 100))
+    prune_l1_lambda = float(os.environ.get("PRUNE_L1_LAMBDA", 0.0))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -421,6 +428,56 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         out[name] = out_t
     return out
 
+
+# -----------------------------
+# PRUNING
+# -----------------------------
+#
+# Gradual magnitude pruning (GMP) with optional L1 shrinkage.  When enabled,
+# a cubic sparsity schedule ramps from 0 to PRUNE_FINAL_SPARSITY over the
+# middle portion of training, then the mask is frozen for recovery.
+
+def get_prunable_params(model: nn.Module) -> list[tuple[str, nn.Parameter]]:
+    """Return block 2D weight matrices eligible for pruning (same set Muon optimizes)."""
+    return [
+        (name, p)
+        for name, p in model.named_parameters()
+        if "blocks." in name and p.ndim == 2
+        and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+
+def compute_sparsity_target(progress: float, final_sparsity: float,
+                            start_frac: float, end_frac: float) -> float:
+    """Cubic sparsity schedule (Zhu & Gupta 2017).  *progress* is 0-1."""
+    if progress < start_frac or final_sparsity <= 0:
+        return 0.0
+    if progress >= end_frac:
+        return final_sparsity
+    t = (progress - start_frac) / max(end_frac - start_frac, 1e-9)
+    return final_sparsity * (1.0 - (1.0 - t) ** 3)
+
+def compute_pruning_masks(prunable_params: list[tuple[str, nn.Parameter]],
+                          sparsity: float) -> dict[str, Tensor]:
+    """Global unstructured magnitude pruning: zero the smallest weights across all params."""
+    if sparsity <= 0:
+        return {}
+    all_abs = torch.cat([p.data.abs().flatten() for _, p in prunable_params])
+    threshold = float(torch.quantile(all_abs.float(), sparsity).item())
+    return {name: (p.data.abs() >= threshold) for name, p in prunable_params}
+
+def apply_pruning_masks(prunable_params: list[tuple[str, nn.Parameter]],
+                        masks: dict[str, Tensor]) -> None:
+    """Zero out pruned weights in-place."""
+    with torch.no_grad():
+        for name, p in prunable_params:
+            if name in masks:
+                p.data.mul_(masks[name])
+
+def measure_sparsity(prunable_params: list[tuple[str, nn.Parameter]]) -> tuple[int, int]:
+    """Return (num_zeros, total_elements) across prunable params."""
+    zeros = sum(int((p.data == 0).sum().item()) for _, p in prunable_params)
+    total = sum(p.numel() for _, p in prunable_params)
+    return zeros, total
 
 # -----------------------------
 # DATA LOADING 
@@ -909,6 +966,19 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
+    # Pruning setup
+    prunable_params = get_prunable_params(base_model) if args.prune_final_sparsity > 0 else []
+    pruning_masks: dict[str, Tensor] = {}
+    current_sparsity_target = 0.0
+    if prunable_params:
+        prunable_elements = sum(p.numel() for _, p in prunable_params)
+        log0(
+            f"pruning:enabled final_sparsity:{args.prune_final_sparsity} "
+            f"start_frac:{args.prune_start_frac} end_frac:{args.prune_end_frac} "
+            f"prune_every:{args.prune_every} l1_lambda:{args.prune_l1_lambda} "
+            f"prunable_tensors:{len(prunable_params)} prunable_elements:{prunable_elements}"
+        )
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -989,9 +1059,14 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            sparsity_msg = ""
+            if prunable_params:
+                n_zeros, n_total = measure_sparsity(prunable_params)
+                sparsity_msg = f" sparsity:{n_zeros / max(n_total, 1):.4f} target:{current_sparsity_target:.4f}"
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                + sparsity_msg
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1018,6 +1093,18 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
+        # Update sparsity target and apply L1 shrinkage to gradients
+        if prunable_params:
+            progress = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+            current_sparsity_target = compute_sparsity_target(
+                progress, args.prune_final_sparsity, args.prune_start_frac, args.prune_end_frac,
+            )
+            if args.prune_l1_lambda > 0 and current_sparsity_target > 0:
+                with torch.no_grad():
+                    for _, p in prunable_params:
+                        if p.grad is not None:
+                            p.grad.add_(args.prune_l1_lambda * torch.sign(p.data))
+
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
@@ -1032,6 +1119,11 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        if prunable_params and current_sparsity_target > 0:
+            if step % args.prune_every == 0 or not pruning_masks:
+                pruning_masks = compute_pruning_masks(prunable_params, current_sparsity_target)
+            apply_pruning_masks(prunable_params, pruning_masks)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1064,6 +1156,11 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    if prunable_params and pruning_masks:
+        apply_pruning_masks(prunable_params, pruning_masks)
+        n_zeros, n_total = measure_sparsity(prunable_params)
+        log0(f"final_sparsity:{n_zeros / max(n_total, 1):.4f} zeros:{n_zeros}/{n_total}")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
