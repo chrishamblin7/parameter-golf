@@ -461,8 +461,9 @@ def compute_pruning_masks(prunable_params: list[tuple[str, nn.Parameter]],
     """Global unstructured magnitude pruning: zero the smallest weights across all params."""
     if sparsity <= 0:
         return {}
-    all_abs = torch.cat([p.data.abs().flatten() for _, p in prunable_params])
-    threshold = float(torch.quantile(all_abs.float(), sparsity).item())
+    all_abs = torch.cat([p.data.abs().flatten().float().cpu() for _, p in prunable_params])
+    k = max(1, int(round(sparsity * all_abs.numel())))
+    threshold = float(all_abs.kthvalue(k).values.item())
     return {name: (p.data.abs() >= threshold) for name, p in prunable_params}
 
 def apply_pruning_masks(prunable_params: list[tuple[str, nn.Parameter]],
@@ -1220,4 +1221,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    main()
+= "__main__":
     main()
